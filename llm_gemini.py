@@ -2,6 +2,7 @@ import llm
 import httpx
 import ijson
 import urllib.parse
+
 # We disable all of these to avoid random unexpected errors
 SAFETY_SETTINGS = [
     {
@@ -38,7 +39,17 @@ def get_available_gemini_models():
     params = {"key": key}
     response = httpx.get(url, params=params)
     response.raise_for_status()
-    return response.json()["models"]
+
+    latest_models = {}
+    for model in response.json()["models"]:
+        model_name = model["name"].replace("models/", "")  # Remove "models/" prefix
+        base_name = model_name.split("-latest")[0]  # Extract base name
+
+        # Store only the latest version for each base name
+        if base_name not in latest_models or model_name.endswith("-latest"):
+            latest_models[base_name] = model_name
+
+    return [{"name": model_name} for model_name in latest_models.values()]
 
 
 class GeminiPro(llm.Model):
@@ -93,11 +104,24 @@ class GeminiPro(llm.Model):
                         yield ""
                     gathered.append(event)
                     events.clear()
+        response.response_json = gathered
+
+
+@llm.hookimpl
+def register_embedding_models(register):
+    register(
+        GeminiEmbeddingModel("text-embedding-004", "text-embedding-004"),
+    )
+
+
+class GeminiEmbeddingModel(llm.EmbeddingModel):
+    needs_key = "gemini"
     key_env_var = "LLM_GEMINI_KEY"
     batch_size = 20
 
-    def __init__(self, model_id):
+    def __init__(self, model_id, gemini_model_id):
         self.model_id = model_id
+        self.gemini_model_id = gemini_model_id
 
     def embed_batch(self, items):
         headers = {
@@ -106,7 +130,7 @@ class GeminiPro(llm.Model):
         data = {
             "requests": [
                 {
-                    "model": self.model_id,
+                    "model": self.gemini_model_id,  # Use consistent model ID
                     "content": {"parts": [{"text": item}]},
                 }
                 for item in items
@@ -114,7 +138,7 @@ class GeminiPro(llm.Model):
         }
         with httpx.Client() as client:
             response = client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_id}:batchEmbedContents?key={self.get_key()}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model_id}:batchEmbedContents?key={self.get_key()}",
                 headers=headers,
                 json=data,
                 timeout=None,
