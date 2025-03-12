@@ -1,9 +1,13 @@
 import copy
 import httpx
 import ijson
+import json
 import llm
+from pathlib import Path
 from pydantic import Field
 from typing import Optional
+import time
+import click
 
 SAFETY_SETTINGS = [
     {
@@ -36,33 +40,143 @@ GOOGLE_SEARCH_MODELS = {
     "gemini-2.0-flash",
 }
 
+# List of hardcoded models
+HARDCODED_MODELS = [
+    "gemini-pro",
+    "gemini-1.5-pro-latest",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-pro-001",
+    "gemini-1.5-flash-001",
+    "gemini-1.5-pro-002",
+    "gemini-1.5-flash-002",
+    "gemini-1.5-flash-8b-latest",
+    "gemini-1.5-flash-8b-001",
+    "gemini-exp-1114",
+    "gemini-exp-1121",
+    "gemini-exp-1206",
+    "gemini-2.0-flash-exp",
+    "learnlm-1.5-pro-experimental",
+    "gemini-2.0-flash-thinking-exp-1219",
+    "gemini-2.0-flash-thinking-exp-01-21",
+    # Released 5th Feb 2025:
+    "gemini-2.0-flash",
+    "gemini-2.0-pro-exp-02-05",
+    # Released 25th Feb 2025:
+    "gemini-2.0-flash-lite",
+]
+
+def fetch_cached_json(url, path, cache_timeout, params=None):
+    """Fetch JSON from URL with caching and fallback to cached data if request fails."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.is_file():
+        mod_time = path.stat().st_mtime
+        if time.time() - mod_time < cache_timeout:
+            with open(path, "r") as file:
+                return json.load(file)
+
+    try:
+        response = httpx.get(url, params=params, follow_redirects=True, timeout=10.0)
+        response.raise_for_status()
+        
+        with open(path, "w") as file:
+            json.dump(response.json(), file)
+            
+        return response.json()
+    except Exception:
+        if path.is_file():
+            with open(path, "r") as file:
+                return json.load(file)
+        # If no cache available, return an empty structure that won't break anything
+        return {"models": []}
+
+# Function to get additional models not in our hardcoded list
+def get_additional_gemini_models():
+    """Fetches additional Gemini models not in our hardcoded list."""
+    key = llm.get_key("", "gemini", "LLM_GEMINI_KEY")
+    
+    # Early return if no key available
+    if not key:
+        return []
+        
+    params = {"key": key}
+    cache_path = llm.user_dir() / "gemini_models.json"
+    cache_timeout = 3600 * 24  # Cache for 24 hours
+    
+    # Get known model IDs as a set for efficient lookups
+    known_models = set(HARDCODED_MODELS)
+    
+    # Create a list of prefixes/patterns to exclude (more comprehensive)
+    exclude_patterns = [
+        "gemini-pro",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-pro",
+        "gemini-exp",
+        "gemini-1.0",
+        "gemini-embedding",
+        "learnlm",
+        "gemini-1.5-flash-8b",
+        "gemini-2.0-flash-thinking",
+        "text-embedding",
+    ]
+    
+    # Add specific exclude patterns for embedding models
+    specific_exclude = [
+        "text-embedding-004",
+        "embedding-gecko",
+        "embedding-001",
+        "text-bison",
+        "chat-bison",
+    ]
+    
+    try:
+        response_data = fetch_cached_json(
+            url="https://generativelanguage.googleapis.com/v1beta/models",
+            path=cache_path,
+            cache_timeout=cache_timeout,
+            params=params
+        )
+        
+        # Process API response for new models
+        new_models = []
+        for model in response_data.get("models", []):
+            model_name = model["name"].replace("models/", "")
+            
+            # Skip exact matches with our hardcoded models
+            if model_name in known_models:
+                continue
+            
+            # Skip if model matches any exclusion pattern
+            skip_model = False
+            for pattern in exclude_patterns:
+                if model_name.startswith(pattern):
+                    skip_model = True
+                    break
+                    
+            # Check specific exclusions
+            for pattern in specific_exclude:
+                if pattern in model_name:
+                    skip_model = True
+                    break
+            
+            if skip_model:
+                continue
+                
+            # If we get here, this is a genuinely new model family
+            new_models.append({"name": model_name})
+        
+        return new_models
+    except Exception as e:
+        # Return empty list if anything fails
+        return []
 
 @llm.hookimpl
 def register_models(register):
-    # Register both sync and async versions of each model
-    for model_id in [
-        "gemini-pro",
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-pro-001",
-        "gemini-1.5-flash-001",
-        "gemini-1.5-pro-002",
-        "gemini-1.5-flash-002",
-        "gemini-1.5-flash-8b-latest",
-        "gemini-1.5-flash-8b-001",
-        "gemini-exp-1114",
-        "gemini-exp-1121",
-        "gemini-exp-1206",
-        "gemini-2.0-flash-exp",
-        "learnlm-1.5-pro-experimental",
-        "gemini-2.0-flash-thinking-exp-1219",
-        "gemini-2.0-flash-thinking-exp-01-21",
-        # Released 5th Feb 2025:
-        "gemini-2.0-flash",
-        "gemini-2.0-pro-exp-02-05",
-        # Released 25th Feb 2025:
-        "gemini-2.0-flash-lite",
-    ]:
+    # First register all our hardcoded models with their proper capabilities
+    for model_id in HARDCODED_MODELS:
         can_google_search = model_id in GOOGLE_SEARCH_MODELS
         register(
             GeminiPro(
@@ -74,6 +188,30 @@ def register_models(register):
                 model_id,
                 can_google_search=can_google_search,
                 can_schema="flash-thinking" not in model_id,
+            ),
+        )
+    
+    # Then try to register any additional models discovered from the API
+    for model in get_additional_gemini_models():
+        model_id = model["name"]
+        # Determine capabilities based on model name patterns
+        can_google_search = any(model_id.startswith(prefix) for prefix in [
+            "gemini-1.5-pro", 
+            "gemini-1.5-flash", 
+            "gemini-2.0-flash"
+        ])
+        can_schema = "flash-thinking" not in model_id
+        
+        register(
+            GeminiPro(
+                model_id,
+                can_google_search=can_google_search,
+                can_schema=can_schema,
+            ),
+            AsyncGeminiPro(
+                model_id,
+                can_google_search=can_google_search,
+                can_schema=can_schema,
             ),
         )
 
@@ -399,6 +537,73 @@ def register_embedding_models(register):
         )
 
 
+@llm.hookimpl
+def register_commands(cli):
+    @cli.group()
+    def gemini():
+        "Commands relating to the llm-gemini plugin"
+
+    @gemini.command()
+    @click.option("--json", "json_", is_flag=True, help="Output as JSON")
+    @click.option("--force", is_flag=True, help="Force refresh the cache")
+    def models(json_, force):
+        """List all available Gemini models from the API"""
+        import json
+        
+        # Force refresh if requested
+        cache_timeout = 0 if force else 3600 * 24
+        
+        key = llm.get_key("", "gemini", "LLM_GEMINI_KEY")
+        if not key:
+            click.echo("No Gemini API key found. Set the LLM_GEMINI_KEY environment variable.")
+            return
+            
+        cache_path = llm.user_dir() / "gemini_models.json"
+        
+        try:
+            response_data = fetch_cached_json(
+                url="https://generativelanguage.googleapis.com/v1beta/models",
+                path=cache_path,
+                cache_timeout=cache_timeout,
+                params={"key": key}
+            )
+            
+            all_models = []
+            for model in response_data.get("models", []):
+                model_name = model["name"].replace("models/", "")
+                all_models.append({
+                    "id": model_name,
+                    "name": model_name,
+                    "description": model.get("description", ""),
+                    "input_token_limit": model.get("inputTokenLimit", 0),
+                    "output_token_limit": model.get("outputTokenLimit", 0),
+                    "supported_generation_methods": model.get("supportedGenerationMethods", []),
+                    "hardcoded": model_name in HARDCODED_MODELS,
+                })
+            
+            if json_:
+                click.echo(json.dumps(all_models, indent=2))
+            else:
+                # Format for display
+                for model in all_models:
+                    bits = []
+                    bits.append(f"- id: {model['id']}")
+                    bits.append(f"  name: {model['name']}")
+                    if model['description']:
+                        bits.append(f"  description: {model['description'][:100]}...")
+                    if model['input_token_limit']:
+                        bits.append(f"  input_token_limit: {model['input_token_limit']:,}")
+                    if model['output_token_limit']:
+                        bits.append(f"  output_token_limit: {model['output_token_limit']:,}")
+                    if model['supported_generation_methods']:
+                        bits.append(f"  supported_methods: {', '.join(model['supported_generation_methods'])}")
+                    bits.append(f"  hardcoded: {model['hardcoded']}")
+                    click.echo("\n".join(bits) + "\n")
+                    
+        except Exception as e:
+            click.echo(f"Error fetching models: {e}")
+
+
 class GeminiEmbeddingModel(llm.EmbeddingModel):
     needs_key = "gemini"
     key_env_var = "LLM_GEMINI_KEY"
@@ -423,7 +628,6 @@ class GeminiEmbeddingModel(llm.EmbeddingModel):
                 for item in items
             ]
         }
-
         with httpx.Client() as client:
             response = client.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model_id}:batchEmbedContents",
@@ -431,7 +635,6 @@ class GeminiEmbeddingModel(llm.EmbeddingModel):
                 json=data,
                 timeout=None,
             )
-
         response.raise_for_status()
         values = [item["values"] for item in response.json()["embeddings"]]
         if self.truncate:
