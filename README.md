@@ -183,3 +183,37 @@ llm keys set gemini
 # Paste key here
 ```
 
+## Image Generation
+
+This plugin supports image generation using both Gemini 2.0 and Imagen 3.0 models:
+
+### Gemini 2.0 Image Generation
+
+Gemini 2.0 models (like `gemini-2.0-flash-exp`) automatically include image generation capabilities. Simply prompt the model to generate images and it will create images along with text, saving them to your current working directory.
+
+```bash
+llm -m gemini-2.0-flash-exp "Generate an image of a futuristic city with flying cars"
+```
+
+The model will decide when to include images based on your prompt. Images are automatically saved to your current working directory.
+
+### Imagen 3.0 Image Generation
+
+For high-quality standalone images, use the dedicated Imagen model, which provides superior image quality:
+
+```bash
+llm -m imagen-3.0-generate-002 "A photorealistic image of a cat wearing a top hat"
+```
+
+You can control the number of images and their aspect ratio:
+
+```bash
+llm -m imagen-3.0-generate-002 --number-of-images 4 --aspect-ratio "16:9" "A beautiful sunset over the mountains"
+```
+
+Options:
+- `--number-of-images`: Generate between 1-4 images (default: 1)
+- `--aspect-ratio`: Choose from "1:1", "3:4", "4:3", "9:16", "16:9" (default: "1:1")
+
+All images are saved to your current working directory and the model's response will include links to the saved images.
+

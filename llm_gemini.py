@@ -106,6 +106,8 @@ def get_additional_gemini_models():
     
     # Get known model IDs as a set for efficient lookups
     known_models = set(HARDCODED_MODELS)
+    # Also exclude the Imagen model to prevent duplicate registration
+    known_models.add("imagen-3.0-generate-002")
     
     # Create a list of prefixes/patterns to exclude (more comprehensive)
     exclude_patterns = [
@@ -121,6 +123,7 @@ def get_additional_gemini_models():
         "gemini-1.5-flash-8b",
         "gemini-2.0-flash-thinking",
         "text-embedding",
+        "imagen", # Add this to exclude all imagen models
     ]
     
     # Add specific exclude patterns for embedding models
@@ -178,18 +181,27 @@ def register_models(register):
     # First register all our hardcoded models with their proper capabilities
     for model_id in HARDCODED_MODELS:
         can_google_search = model_id in GOOGLE_SEARCH_MODELS
+        can_generate_images = "gemini-2.0" in model_id
         register(
             GeminiPro(
                 model_id,
                 can_google_search=can_google_search,
                 can_schema="flash-thinking" not in model_id,
+                can_generate_images=can_generate_images,
             ),
             AsyncGeminiPro(
                 model_id,
                 can_google_search=can_google_search,
                 can_schema="flash-thinking" not in model_id,
+                can_generate_images=can_generate_images,
             ),
         )
+    
+    # Register Imagen model for dedicated image generation
+    register(
+        ImagenModel("imagen-3.0-generate-002"),
+        AsyncImagenModel("imagen-3.0-generate-002"),
+    )
     
     # Then try to register any additional models discovered from the API
     for model in get_additional_gemini_models():
@@ -201,17 +213,20 @@ def register_models(register):
             "gemini-2.0-flash"
         ])
         can_schema = "flash-thinking" not in model_id
+        can_generate_images = "gemini-2.0" in model_id
         
         register(
             GeminiPro(
                 model_id,
                 can_google_search=can_google_search,
                 can_schema=can_schema,
+                can_generate_images=can_generate_images,
             ),
             AsyncGeminiPro(
                 model_id,
                 can_google_search=can_google_search,
                 can_schema=can_schema,
+                can_generate_images=can_generate_images,
             ),
         )
 
@@ -331,6 +346,14 @@ class _SharedGemini:
             description="Output a valid JSON object {...}",
             default=None,
         )
+        number_of_images: Optional[int] = Field(
+            description="Number of images to generate (1-4, for image generation models)",
+            default=None,
+        )
+        aspect_ratio: Optional[str] = Field(
+            description="Aspect ratio for generated images (1:1, 3:4, 4:3, 9:16, 16:9)",
+            default=None,
+        )
 
     class OptionsWithGoogleSearch(Options):
         google_search: Optional[bool] = Field(
@@ -338,10 +361,11 @@ class _SharedGemini:
             default=None,
         )
 
-    def __init__(self, model_id, can_google_search=False, can_schema=False):
+    def __init__(self, model_id, can_google_search=False, can_schema=False, can_generate_images=False):
         self.model_id = model_id
         self.can_google_search = can_google_search
         self.supports_schema = can_schema
+        self.can_generate_images = can_generate_images
         if can_google_search:
             self.Options = self.OptionsWithGoogleSearch
 
@@ -408,34 +432,111 @@ class _SharedGemini:
             "top_p": "topP",
             "top_k": "topK",
         }
+        
+        # Set up generation config
+        generation_config = {}
+        
+        # Handle JSON object configuration
         if prompt.options and prompt.options.json_object:
-            body["generationConfig"] = {"response_mime_type": "application/json"}
-
-        if any(
-            getattr(prompt.options, key, None) is not None for key in config_map.keys()
-        ):
-            generation_config = {}
+            generation_config["response_mime_type"] = "application/json"
+            
+        # Enable image generation for compatible models
+        if self.can_generate_images:
+            generation_config["response_modalities"] = ["Text", "Image"]
+        
+        # Add other configuration options
+        if prompt.options:
             for key, other_key in config_map.items():
                 config_value = getattr(prompt.options, key, None)
                 if config_value is not None:
                     generation_config[other_key] = config_value
+        
+        # Add the generation config if we have any settings
+        if generation_config:
             body["generationConfig"] = generation_config
 
         return body
 
-    def process_part(self, part):
+    def display_image_in_terminal(self, filename):
+        """
+        Attempts to display an image in the terminal, focusing on iTerm imgcat functionality.
+        Suppress errors but ensure the image displays correctly.
+        """
+        import os
+        import subprocess
+        
+        # Simple approach - try imgcat first, then fall back to open on macOS
+        try:
+            # For imgcat - we need to NOT redirect stdout for the image to display
+            # but we DO want to suppress stderr where errors appear
+            with open(os.devnull, 'w') as devnull:
+                subprocess.run(["imgcat", filename], stderr=devnull, check=False)
+            return True
+        except (subprocess.SubprocessError, FileNotFoundError):
+            # Fall back to open on macOS
+            try:
+                with open(os.devnull, 'w') as devnull:
+                    subprocess.run(["open", filename], stderr=devnull, check=False)
+                return True
+            except (subprocess.SubprocessError, FileNotFoundError):
+                pass
+        
+        return False
+
+    def save_image(self, image_data, prompt_text, index=0):
+        """Save a generated image to the current working directory with a descriptive name."""
+        import base64
+        from PIL import Image
+        from io import BytesIO
+        import os
+        
+        # Generate a unique filename based on timestamp and prompt
+        timestamp = int(time.time())
+        # Clean the prompt to use in filename (first 20 chars)
+        clean_prompt = "".join(c for c in prompt_text[:20] if c.isalnum() or c in (' ', '_')).strip()
+        clean_prompt = clean_prompt.replace(' ', '_')
+        
+        # Create filename
+        filename = f"gemini_image_{clean_prompt}_{timestamp}_{index}.png"
+        
+        # Save the image
+        try:
+            # Try to decode if it's base64
+            try:
+                image_bytes = base64.b64decode(image_data)
+            except:
+                # If not base64, assume it's already binary
+                image_bytes = image_data
+                
+            image = Image.open(BytesIO(image_bytes))
+            image.save(filename)
+            
+            # Try to display the image in terminal
+            self.display_image_in_terminal(filename)
+                    
+            return filename
+        except Exception as e:
+            return f"Error saving image: {str(e)}"
+
+    def process_part(self, part, prompt_text=""):
         if "text" in part:
             return part["text"]
         elif "executableCode" in part:
             return f'```{part["executableCode"]["language"].lower()}\n{part["executableCode"]["code"].strip()}\n```\n'
         elif "codeExecutionResult" in part:
             return f'```\n{part["codeExecutionResult"]["output"].strip()}\n```\n'
+        elif "inlineData" in part:
+            mime_type = part["inlineData"].get("mimeType", "")
+            if mime_type.startswith("image/"):
+                # Save the image and return its path
+                image_path = self.save_image(part["inlineData"]["data"], prompt_text)
+                return f"\n\n[Generated image saved to: {image_path}]\n\n"
         return ""
 
-    def process_candidates(self, candidates):
+    def process_candidates(self, candidates, prompt_text=""):
         # We only use the first candidate
         for part in candidates[0]["content"]["parts"]:
-            yield self.process_part(part)
+            yield self.process_part(part, prompt_text)
 
     def set_usage(self, response):
         try:
@@ -476,7 +577,7 @@ class GeminiPro(_SharedGemini, llm.KeyModel):
                         if isinstance(event, dict) and "error" in event:
                             raise llm.ModelError(event["error"]["message"])
                         try:
-                            yield from self.process_candidates(event["candidates"])
+                            yield from self.process_candidates(event["candidates"], prompt.prompt)
                         except KeyError:
                             yield ""
                         gathered.append(event)
@@ -509,7 +610,7 @@ class AsyncGeminiPro(_SharedGemini, llm.AsyncKeyModel):
                                 raise llm.ModelError(event["error"]["message"])
                             try:
                                 for chunk in self.process_candidates(
-                                    event["candidates"]
+                                    event["candidates"], prompt.prompt
                                 ):
                                     yield chunk
                             except KeyError:
@@ -518,6 +619,137 @@ class AsyncGeminiPro(_SharedGemini, llm.AsyncKeyModel):
                         events.clear()
         response.response_json = gathered[-1]
         self.set_usage(response)
+
+
+class ImagenModel(llm.KeyModel):
+    """
+    Model for Imagen image generation.
+    
+    This model uses the Google GenAI SDK to generate high-quality images.
+    """
+    needs_key = "gemini"
+    key_env_var = "LLM_GEMINI_KEY"
+    can_stream = False
+    
+    class Options(llm.Options):
+        number_of_images: int = Field(
+            description="Number of images to generate (1-4)",
+            default=1,
+            ge=1,
+            le=4,
+        )
+        aspect_ratio: str = Field(
+            description="Aspect ratio of generated images (1:1, 3:4, 4:3, 9:16, 16:9)",
+            default="1:1",
+        )
+        
+    def __init__(self, model_id):
+        self.model_id = model_id
+
+    def __str__(self):
+        return f"Imagen: {self.model_id}"
+    
+    def display_image_in_terminal(self, filename):
+        """
+        Attempts to display an image in the terminal, focusing on iTerm imgcat functionality.
+        Suppress errors but ensure the image displays correctly.
+        """
+        import os
+        import subprocess
+        
+        # Simple approach - try imgcat first, then fall back to open on macOS
+        try:
+            # For imgcat - we need to NOT redirect stdout for the image to display
+            # but we DO want to suppress stderr where errors appear
+            with open(os.devnull, 'w') as devnull:
+                subprocess.run(["imgcat", filename], stderr=devnull, check=False)
+            return True
+        except (subprocess.SubprocessError, FileNotFoundError):
+            # Fall back to open on macOS
+            try:
+                with open(os.devnull, 'w') as devnull:
+                    subprocess.run(["open", filename], stderr=devnull, check=False)
+                return True
+            except (subprocess.SubprocessError, FileNotFoundError):
+                pass
+        
+        return False
+    
+    def execute(self, prompt, stream, response, conversation, key):
+        from google import genai
+        from google.genai import types
+        from PIL import Image
+        from io import BytesIO
+        import os
+        import time
+        
+        # Get configuration
+        number_of_images = getattr(prompt.options, "number_of_images", 1)
+        aspect_ratio = getattr(prompt.options, "aspect_ratio", "1:1")
+        
+        # Save original request for response debugging
+        response._prompt_json = {
+            "prompt": prompt.prompt,
+            "config": {
+                "number_of_images": number_of_images,
+                "aspect_ratio": aspect_ratio,
+            }
+        }
+        
+        try:
+            # Initialize client with the key from LLM's key management
+            client = genai.Client(api_key=self.get_key(key))
+            
+            # Make request using the correct method as shown in the test
+            generation_response = client.models.generate_image(
+                model=self.model_id,
+                prompt=prompt.prompt,
+                config=types.GenerateImageConfig(
+                    number_of_images=number_of_images,
+                    aspect_ratio=aspect_ratio,
+                )
+            )
+            
+            # Store the response for debugging
+            response.response_json = {"sdk_response": "Successfully generated images"}
+            
+            # Process the images - using the correct response structure
+            image_paths = []
+            for i, generated_image in enumerate(generation_response.generated_images):
+                # Generate a unique filename based on timestamp and prompt
+                timestamp = int(time.time())
+                # Clean the prompt to use in filename (first 20 chars)
+                clean_prompt = "".join(c for c in prompt.prompt[:20] if c.isalnum() or c in (' ', '_')).strip()
+                clean_prompt = clean_prompt.replace(' ', '_')
+                
+                # Create filename
+                filename = f"imagen_{clean_prompt}_{timestamp}_{i+1}.png"
+                
+                # Save the image - using the correct attribute for image bytes
+                try:
+                    image = Image.open(BytesIO(generated_image.image.image_bytes))
+                    image.save(filename)
+                    image_paths.append(filename)
+                    
+                    # Display the image in terminal if possible
+                    self.display_image_in_terminal(filename)
+                except Exception as e:
+                    print(f"Error saving image: {str(e)}")
+            
+            # Construct response text with image paths
+            if image_paths:
+                paths_text = "\n".join([f"- {path}" for path in image_paths])
+                response_text = f"Generated {len(image_paths)} image(s) based on your prompt:\n\n{paths_text}"
+            else:
+                response_text = "No images were generated. The prompt may have been rejected by the safety filter."
+            
+            response._text = response_text
+            return response_text
+            
+        except Exception as e:
+            error_message = f"Error generating images: {str(e)}"
+            response._text = error_message
+            return error_message
 
 
 @llm.hookimpl
@@ -640,3 +872,145 @@ class GeminiEmbeddingModel(llm.EmbeddingModel):
         if self.truncate:
             values = [value[: self.truncate] for value in values]
         return values
+
+
+class AsyncImagenModel(llm.AsyncKeyModel):
+    """
+    Async Model for Imagen image generation.
+    
+    This model uses the Google GenAI SDK to generate high-quality images.
+    """
+    needs_key = "gemini"
+    key_env_var = "LLM_GEMINI_KEY"
+    can_stream = False
+    
+    class Options(llm.Options):
+        number_of_images: int = Field(
+            description="Number of images to generate (1-4)",
+            default=1,
+            ge=1,
+            le=4,
+        )
+        aspect_ratio: str = Field(
+            description="Aspect ratio of generated images (1:1, 3:4, 4:3, 9:16, 16:9)",
+            default="1:1",
+        )
+        
+    def __init__(self, model_id):
+        self.model_id = model_id
+
+    def __str__(self):
+        return f"Imagen: {self.model_id}"
+        
+    def display_image_in_terminal(self, filename):
+        """
+        Attempts to display an image in the terminal, focusing on iTerm imgcat functionality.
+        Suppress errors but ensure the image displays correctly.
+        """
+        import os
+        import subprocess
+        
+        # Simple approach - try imgcat first, then fall back to open on macOS
+        try:
+            # For imgcat - we need to NOT redirect stdout for the image to display
+            # but we DO want to suppress stderr where errors appear
+            with open(os.devnull, 'w') as devnull:
+                subprocess.run(["imgcat", filename], stderr=devnull, check=False)
+            return True
+        except (subprocess.SubprocessError, FileNotFoundError):
+            # Fall back to open on macOS
+            try:
+                with open(os.devnull, 'w') as devnull:
+                    subprocess.run(["open", filename], stderr=devnull, check=False)
+                return True
+            except (subprocess.SubprocessError, FileNotFoundError):
+                pass
+        
+        return False
+    
+    async def execute(self, prompt, stream, response, conversation, key):
+        import asyncio
+        from google import genai
+        from google.genai import types
+        from PIL import Image
+        from io import BytesIO
+        import os
+        import time
+        
+        # Get configuration
+        number_of_images = getattr(prompt.options, "number_of_images", 1)
+        aspect_ratio = getattr(prompt.options, "aspect_ratio", "1:1")
+        
+        # Save original request for response debugging
+        response._prompt_json = {
+            "prompt": prompt.prompt,
+            "config": {
+                "number_of_images": number_of_images,
+                "aspect_ratio": aspect_ratio,
+            }
+        }
+        
+        try:
+            # Since the SDK might not have async support, we run it in a thread pool
+            loop = asyncio.get_event_loop()
+            
+            # Define a function to create client and make the request
+            def generate_images():
+                client = genai.Client(api_key=self.get_key(key))
+                return client.models.generate_image(
+                    model=self.model_id,
+                    prompt=prompt.prompt,
+                    config=types.GenerateImageConfig(
+                        number_of_images=number_of_images,
+                        aspect_ratio=aspect_ratio,
+                    )
+                )
+            
+            # Run the synchronous SDK code in an executor
+            generation_response = await loop.run_in_executor(None, generate_images)
+            
+            # Store the response for debugging
+            response.response_json = {"sdk_response": "Successfully generated images"}
+            
+            # Process the images
+            image_paths = []
+            for i, generated_image in enumerate(generation_response.generated_images):
+                # Generate a unique filename based on timestamp and prompt
+                timestamp = int(time.time())
+                # Clean the prompt to use in filename (first 20 chars)
+                clean_prompt = "".join(c for c in prompt.prompt[:20] if c.isalnum() or c in (' ', '_')).strip()
+                clean_prompt = clean_prompt.replace(' ', '_')
+                
+                # Create filename
+                filename = f"imagen_{clean_prompt}_{timestamp}_{i+1}.png"
+                
+                # Save the image - run file operations in executor to avoid blocking
+                try:
+                    def save_image():
+                        image = Image.open(BytesIO(generated_image.image.image_bytes))
+                        image.save(filename)
+                        
+                        # Display the image in terminal if possible
+                        self.display_image_in_terminal(filename)
+                        
+                        return filename
+                    
+                    saved_filename = await loop.run_in_executor(None, save_image)
+                    image_paths.append(saved_filename)
+                except Exception as e:
+                    print(f"Error saving image: {str(e)}")
+            
+            # Construct response text with image paths
+            if image_paths:
+                paths_text = "\n".join([f"- {path}" for path in image_paths])
+                response_text = f"Generated {len(image_paths)} image(s) based on your prompt:\n\n{paths_text}"
+            else:
+                response_text = "No images were generated. The prompt may have been rejected by the safety filter."
+            
+            response._text = response_text
+            return response_text
+            
+        except Exception as e:
+            error_message = f"Error generating images: {str(e)}"
+            response._text = error_message
+            return error_message
