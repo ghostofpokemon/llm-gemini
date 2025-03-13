@@ -503,7 +503,7 @@ class _SharedGemini:
             if mime_type.startswith("image/"):
                 # Save the image and return its path with new elegant format
                 image_path = self.save_image(part["inlineData"]["data"], prompt_text)
-                return f"\n\n⬚ ⇴ {image_path}\n\n"
+                return f"\n\n⬚  ⇴ {image_path}\n\n"
         return ""
 
     def process_candidates(self, candidates, prompt_text=""):
@@ -777,7 +777,7 @@ class ImagenModel(llm.KeyModel):
             
             # Construct response text with image paths - elegant format
             if image_paths:
-                paths_text = "\n".join([f"⬚ ⇴ {path}" for path in image_paths])
+                paths_text = "\n".join([f"⬚  ⇴ {path}" for path in image_paths])
                 response_text = f"\n\n{paths_text}"
             else:
                 response_text = "No images were returned. Try a different prompt."
@@ -903,7 +903,7 @@ class AsyncImagenModel(llm.AsyncKeyModel):
             
             # Construct response text with image paths - elegant format
             if image_paths:
-                paths_text = "\n".join([f"⬚ ⇴ {path}" for path in image_paths])
+                paths_text = "\n".join([f"⬚  ⇴ {path}" for path in image_paths])
                 response_text = f"\n\n{paths_text}"
             else:
                 response_text = "No images were returned. Try a different prompt."
