@@ -205,15 +205,15 @@ For high-quality standalone images, use the dedicated Imagen model, which provid
 llm -m imagen-3.0-generate-002 "A photorealistic image of a cat wearing a top hat"
 ```
 
-You can control the number of images and their aspect ratio:
+You can control various parameters using the `-o` option format:
 
 ```bash
-llm -m imagen-3.0-generate-002 --number-of-images 4 --aspect-ratio "16:9" "A beautiful sunset over the mountains"
+llm -m imagen-3.0-generate-002 -o number_of_images 4 -o aspect_ratio "16:9" "A beautiful sunset over the mountains"
 ```
 
-Options:
-- `--number-of-images`: Generate between 1-4 images (default: 1)
-- `--aspect-ratio`: Choose from "1:1", "3:4", "4:3", "9:16", "16:9" (default: "1:1")
+Available parameters:
+
+- `number_of_images`: Generate between 1-4 images (default: 1)
+- `aspect_ratio`: Choose from "1:1", "3:4", "4:3", "9:16", "16:9" (default: "1:1")
 
 All images are saved to your current working directory and the model's response will include links to the saved images.
-
