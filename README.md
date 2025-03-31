@@ -197,6 +197,8 @@ llm -m gemini-2.0-flash-exp "Generate an image of a futuristic city with flying 
 
 The model will decide when to include images based on your prompt. Images are automatically saved to your current working directory.
 
+**Note:** Sometimes in longer conversations, the model may start outputting text descriptions instead of generating actual images. If this happens, you can redirect it back to image generation by saying something like: "Instead of describing the image format, please generate an actual image like you did in your first response."
+
 ### Imagen 3.0 Image Generation
 
 For high-quality standalone images, use the dedicated Imagen model, which provides superior image quality:
